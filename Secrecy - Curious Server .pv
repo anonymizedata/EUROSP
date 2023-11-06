@@ -1,0 +1,161 @@
+(*channels*)
+free ch: channel.
+
+(*types*)
+type sskey.
+type pskey.
+type embFeature.
+type id.
+type header.
+
+free authHeader: header.
+free enrolHeader: header.
+
+table enrolTable(id, bitstring, pskey).
+
+event serverChallenged.
+event serverVerified.
+event enrolRequested(id, id, bitstring, pskey).
+event enrolVerified(id, id, bitstring, pskey).
+event recordSent(id, bitstring, pskey).
+event recordVerified(id, bitstring, pskey).
+event honestVendors(id, bitstring).
+
+
+(*Note that to check the secrecy of csr (or w,R,ssk) we cannot directly use "query secret csr" (or w,R,ssk) because the attacker is allowed to be a vendor and 
+so proverif will find a trivial false attack where these elements belong to the attacker's process. So instead, we check the secrecy of these elements just in
+the non-attacker processes by capturing the "honestVendors" event. Indeed, this technique excludes the Vendor process run by the attacker from secrecy check*)
+query vID:id, csr:bitstring; attacker(csr) && event(honestVendors(vID, csr)). (*it is the same as "query secret csrR."*)
+
+(*It is clear that if the above query holds then these two following secrecy queries will be satisfied.*)
+query vID:id, csr:bitstring; attacker(imgProcess(csr)) && event(honestVendors(vID, csr)).
+query vID:id, csr:bitstring; attacker(genR(imgProcess(csr))) && event(honestVendors(vID, csr)).
+
+query secret csrF.
+
+(*functions*)
+fun pk(sskey) : pskey.
+fun sign(bitstring, sskey) : bitstring.
+fun imgProcess(bitstring) : embFeature.
+fun genR(embFeature) : bitstring.
+fun genP(embFeature) : bitstring.
+fun signKeyGenS(bitstring) : sskey.
+fun bitstringToID(bitstring):id [typeConverter].
+
+reduc forall m:bitstring, ssk:sskey; checksign(sign(m,ssk), pk(ssk)) = m.
+reduc forall m:bitstring, ssk:sskey; getmess(sign(m, ssk)) = m.
+reduc forall w:embFeature; rep(w, genP(w)) = genR(w).
+
+(*--------------Auth Device Process--------------*)
+let AD (pch:channel, ADskey:sskey, ASpkey: pskey) =
+
+    in(pch, (msgHeader:header, x:bitstring));
+
+    if (msgHeader = enrolHeader) then
+    (
+        (*Enrollment Phase*)
+        let (vID:id, csrAD:bitstring) = x in
+        new nED: bitstring;
+        out(ch, (enrolHeader, vID, nED));
+        in(ch, (mRS:bitstring, sRS:bitstring));
+        let (=mRS) = checksign(sRS, ASpkey) in
+        let (=vID, csrID:id, =nED, nRS:bitstring) = mRS in
+        event serverVerified;
+        let w = imgProcess(csrAD) in
+        let R = genR(w) in 
+        let P = genP(w) in
+        let ssk = signKeyGenS(R) in
+        let psk = pk(ssk) in
+        let mED = (csrID, P, psk, nED, nRS) in
+        let sED = sign((mED), ADskey) in
+        event enrolRequested(vID, csrID, P, psk);
+        out(ch, (mED, sED))
+    )
+
+    else if (msgHeader = authHeader) then
+    (
+        (*Authentication Phase*)
+        let (csrID':id, csr':bitstring) = x in
+        new nED':bitstring;
+        out(ch, (authHeader , csrID', nED'));
+        in(ch, (mCSR:bitstring, sCSR:bitstring));
+        let (=mCSR) = checksign(sCSR, ASpkey) in
+        let (=csrID', P':bitstring, psk':pskey, =nED', nRS':bitstring) = mCSR in
+        let w' = imgProcess(csr') in
+        let R' = rep(w',P') in
+        let ssk' = signKeyGenS(R') in
+        let psk'' = pk(ssk') in
+        if (psk' = psk'') then
+        (
+            event recordVerified(csrID', P', psk')
+        )
+    )
+    else 0.
+
+(*---------------Auth Server Process-------------*)
+let AS (ASskey:sskey, ADpkey:pskey) =
+
+    in(ch, (msgHeader:header, x:bitstring));
+    if (msgHeader = enrolHeader) then
+    (
+        (*Enrollment Phase*)
+        let (vID:id, nED:bitstring) = x in
+        in(ch, nRS:bitstring);
+        in(ch, csrID: id);
+        let mRS = (vID, csrID, nED, nRS) in
+        let sRS = sign((mRS), ASskey) in
+        event serverChallenged;
+        out(ch, (mRS, sRS));
+        in(ch, (mED:bitstring, sED:bitstring));
+        let (=mED) = checksign(sED, ADpkey) in
+        let (=csrID, P:bitstring, psk:pskey, =nED, =nRS) = mED in
+        insert enrolTable(csrID, P, psk);
+        event enrolVerified(vID, csrID, P, psk)
+    )
+ 
+    else if (msgHeader = authHeader) then
+    (
+        (*Authentication Phase*)
+        let (csrID':id, nED':bitstring) = x in
+        in(ch, nRS':bitstring);
+        get enrolTable(=csrID', P', psk') in
+        let mCSR = (csrID', P', psk', nED', nRS') in
+        let sCSR = sign((mCSR), ASskey) in
+
+        event recordSent(csrID', P', psk');
+        out(ch, (mCSR, sCSR))
+    )
+    else 0.
+
+(*----------Vendor Process-------------*)
+let Vendor (pch:channel, vID:id, csrV:bitstring) =
+    (*Enrollment Request*)
+    out(pch, (enrolHeader, (vID, csrV))).
+
+(*-----------------User Process------------------*)
+let User (pch:channel, csrU:bitstring) =
+    (*Authentication Request*)
+    (*The attacker starts the authentication phase by choosing a csrID*)
+    in(ch, csrID:id);
+    out(pch, (authHeader, (csrID, csrU))).
+(*---------------------Main----------------------*)
+process
+
+new pch:channel;
+new ADskey: sskey;
+let ADpkey = pk(ADskey) in out(ch, ADpkey);
+new ASskey: sskey;
+let ASpkey = pk(ASskey) in out(ch, (ASskey, ASpkey));
+
+(*User and Vendor processes run by the attacker*)
+(in(ch, (csrA:bitstring)); in(ch, (vID:id, csrV:bitstring)); User(pch, csrA) | Vendor(pch, vID, csrV)) |
+(*same csrID for enrollment and authentication*)
+!(
+    new vID:id; new csrF:bitstring; new csrR:bitstring; event honestVendors(vID, csrR); 
+    Vendor(pch, vID, csrR) | (*Vendor process*)
+    User(pch, csrR) | (*User authenticates an enrolled artifact*)
+    User(pch, csrF)   (*User authenticates a not-enrolled artifact*)
+)  
+| (!AD(pch, ADskey, ASpkey)) 
+| !AS(ASskey, ADpkey)
+ 
